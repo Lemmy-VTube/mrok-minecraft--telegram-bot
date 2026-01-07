@@ -440,23 +440,131 @@ class MinecraftServerBot:
         return text
     
     def get_server_info(self) -> str:
-        """Получает информацию о сервере."""
+        """Получает детальную информацию о сервере."""
         info_lines = [self.get_server_status()]
         
         try:
+            # Информация о CPU
+            try:
+                # Количество ядер
+                cpu_cores = subprocess.run(["nproc"], capture_output=True, text=True, timeout=5)
+                cores_count = cpu_cores.stdout.strip() if cpu_cores.returncode == 0 else "N/A"
+                
+                # Информация о процессоре
+                cpu_info = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=5)
+                cpu_model = "N/A"
+                cpu_freq = "N/A"
+                
+                if cpu_info.returncode == 0:
+                    for line in cpu_info.stdout.split('\n'):
+                        if 'Model name:' in line:
+                            cpu_model = line.split(':', 1)[1].strip()
+                        elif 'CPU MHz:' in line:
+                            freq_mhz = float(line.split(':', 1)[1].strip())
+                            cpu_freq = f"{freq_mhz/1000:.2f} GHz"
+                
+                # Загрузка CPU
+                cpu_load = subprocess.run(["cat", "/proc/loadavg"], capture_output=True, text=True, timeout=5)
+                load_avg = "N/A"
+                if cpu_load.returncode == 0:
+                    load_parts = cpu_load.stdout.strip().split()
+                    if len(load_parts) >= 3:
+                        load_1m = float(load_parts[0])
+                        load_5m = float(load_parts[1])
+                        load_15m = float(load_parts[2])
+                        cores_num = int(cores_count) if cores_count != "N/A" else 1
+                        load_percent = (load_1m / cores_num) * 100
+                        load_avg = f"{load_1m:.2f} ({load_percent:.1f}%)"
+                
+                info_lines.append(f"<b>💻 CPU:</b> {cpu_model}")
+                info_lines.append(f"<b>🔧 Ядер:</b> {cores_count} @ {cpu_freq}")
+                info_lines.append(f"<b>📊 Загрузка:</b> {load_avg}")
+                
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о CPU: {e}")
+                info_lines.append(f"<b>💻 CPU:</b> Ошибка получения данных")
+            
+            # Детальная информация о памяти
+            try:
+                memory_result = subprocess.run(["free", "-b"], capture_output=True, text=True, timeout=5)
+                if memory_result.returncode == 0:
+                    memory_lines = memory_result.stdout.strip().split("\n")
+                    if len(memory_lines) > 1:
+                        mem_data = memory_lines[1].split()
+                        if len(mem_data) >= 7:
+                            total_bytes = int(mem_data[1])
+                            used_bytes = int(mem_data[2])
+                            free_bytes = int(mem_data[3])
+                            available_bytes = int(mem_data[6])
+                            
+                            # Конвертируем в удобные единицы
+                            total_gb = total_bytes / (1024**3)
+                            used_gb = used_bytes / (1024**3)
+                            available_gb = available_bytes / (1024**3)
+                            used_percent = (used_bytes / total_bytes) * 100
+                            
+                            info_lines.append(f"<b>🧠 ОЗУ:</b> {used_gb:.1f}GB / {total_gb:.1f}GB ({used_percent:.1f}%)")
+                            info_lines.append(f"<b>💾 Доступно:</b> {available_gb:.1f}GB")
+                        else:
+                            info_lines.append(f"<b>🧠 ОЗУ:</b> Ошибка парсинга данных")
+                    else:
+                        info_lines.append(f"<b>🧠 ОЗУ:</b> Недоступно")
+                else:
+                    info_lines.append(f"<b>🧠 ОЗУ:</b> Ошибка получения")
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о памяти: {e}")
+                info_lines.append(f"<b>🧠 ОЗУ:</b> Ошибка получения данных")
+            
+            # Детальная информация о диске
+            try:
+                disk_result = subprocess.run(["df", "-B1", "/server"], capture_output=True, text=True, timeout=5)
+                if disk_result.returncode == 0:
+                    disk_lines = disk_result.stdout.strip().split("\n")
+                    if len(disk_lines) > 1:
+                        disk_data = disk_lines[1].split()
+                        if len(disk_data) >= 6:
+                            total_bytes = int(disk_data[1])
+                            used_bytes = int(disk_data[2])
+                            available_bytes = int(disk_data[3])
+                            used_percent = float(disk_data[4].replace('%', ''))
+                            
+                            # Конвертируем в удобные единицы
+                            if total_bytes >= 1024**4:  # TB
+                                total_size = f"{total_bytes / (1024**4):.1f}TB"
+                                used_size = f"{used_bytes / (1024**4):.1f}TB"
+                                available_size = f"{available_bytes / (1024**4):.1f}TB"
+                            elif total_bytes >= 1024**3:  # GB
+                                total_size = f"{total_bytes / (1024**3):.1f}GB"
+                                used_size = f"{used_bytes / (1024**3):.1f}GB"
+                                available_size = f"{available_bytes / (1024**3):.1f}GB"
+                            else:  # MB
+                                total_size = f"{total_bytes / (1024**2):.1f}MB"
+                                used_size = f"{used_bytes / (1024**2):.1f}MB"
+                                available_size = f"{available_bytes / (1024**2):.1f}MB"
+                            
+                            info_lines.append(f"<b>💽 Диск:</b> {used_size} / {total_size} ({used_percent:.1f}%)")
+                            info_lines.append(f"<b>📁 Свободно:</b> {available_size}")
+                        else:
+                            info_lines.append(f"<b>💽 Диск:</b> Ошибка парсинга данных")
+                    else:
+                        info_lines.append(f"<b>💽 Диск:</b> Недоступно")
+                else:
+                    info_lines.append(f"<b>💽 Диск:</b> Ошибка получения")
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о диске: {e}")
+                info_lines.append(f"<b>💽 Диск:</b> Ошибка получения данных")
+            
             # Ядро системы
             try:
                 kernel_result = subprocess.run(["uname", "-r"], capture_output=True, text=True, timeout=5)
                 if kernel_result.returncode == 0:
                     kernel = kernel_result.stdout.strip()
-                    info_lines.append(f"<b>Ядро системы:</b> {kernel}")
+                    info_lines.append(f"<b>🐧 Ядро:</b> {kernel}")
                 else:
-                    info_lines.append(f"<b>Ядро системы:</b> Недоступно")
-            except FileNotFoundError:
-                info_lines.append(f"<b>Ядро системы:</b> Команда uname не найдена")
+                    info_lines.append(f"<b>🐧 Ядро:</b> Недоступно")
             except Exception as e:
                 logger.error(f"Ошибка получения информации о ядре: {e}")
-                info_lines.append(f"<b>Ядро системы:</b> Ошибка получения")
+                info_lines.append(f"<b>🐧 Ядро:</b> Ошибка получения")
             
             # Java версия
             try:
@@ -466,66 +574,37 @@ class MinecraftServerBot:
                     java_output = java.stderr if java.stderr else java.stdout
                     java_lines = java_output.strip().split("\n")
                     if java_lines:
-                        info_lines.append(f"<b>Java:</b> {java_lines[0]}")
+                        # Извлекаем только версию из первой строки
+                        version_line = java_lines[0]
+                        if 'version' in version_line:
+                            version_part = version_line.split('version')[1].strip().strip('"')
+                            info_lines.append(f"<b>☕ Java:</b> {version_part}")
+                        else:
+                            info_lines.append(f"<b>☕ Java:</b> {version_line}")
                 else:
-                    info_lines.append(f"<b>Java:</b> Не установлена")
+                    info_lines.append(f"<b>☕ Java:</b> Не установлена")
             except FileNotFoundError:
-                info_lines.append(f"<b>Java:</b> Не найдена")
+                info_lines.append(f"<b>☕ Java:</b> Не найдена")
             except Exception as e:
                 logger.error(f"Ошибка получения информации о Java: {e}")
-                info_lines.append(f"<b>Java:</b> Ошибка проверки")
-            
-            # Загрузка CPU и памяти
-            try:
-                memory_result = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
-                if memory_result.returncode == 0:
-                    memory_lines = memory_result.stdout.strip().split("\n")
-                    if len(memory_lines) > 1:
-                        memory_info = " ".join(memory_lines[1].split()[1:4])
-                        info_lines.append(f"<b>Память:</b> {memory_info}")
-                    else:
-                        info_lines.append(f"<b>Память:</b> Недоступно")
-                else:
-                    info_lines.append(f"<b>Память:</b> Ошибка получения")
-            except FileNotFoundError:
-                info_lines.append(f"<b>Память:</b> Команда free не найдена")
-            except Exception as e:
-                logger.error(f"Ошибка получения информации о памяти: {e}")
-                info_lines.append(f"<b>Память:</b> Ошибка получения")
-            
-            # Дисковое пространство
-            try:
-                disk_result = subprocess.run(["df", "-h", "/server"], capture_output=True, text=True, timeout=5)
-                if disk_result.returncode == 0:
-                    disk_lines = disk_result.stdout.strip().split("\n")
-                    if len(disk_lines) > 1:
-                        disk_info = " ".join(disk_lines[1].split()[1:5])
-                        info_lines.append(f"<b>Диск:</b> {disk_info}")
-                    else:
-                        info_lines.append(f"<b>Диск:</b> Недоступно")
-                else:
-                    info_lines.append(f"<b>Диск:</b> Ошибка получения")
-            except FileNotFoundError:
-                info_lines.append(f"<b>Диск:</b> Команда df не найдена")
-            except Exception as e:
-                logger.error(f"Ошибка получения информации о диске: {e}")
-                info_lines.append(f"<b>Диск:</b> Ошибка получения")
+                info_lines.append(f"<b>☕ Java:</b> Ошибка проверки")
             
             # Белый список
             try:
                 whitelist = self.load_whitelist()
-                info_lines.append(f"<b>Игроков в белом списке:</b> {len(whitelist)}")
+                info_lines.append(f"<b>👥 Белый список:</b> {len(whitelist)} игроков")
             except Exception as e:
                 logger.error(f"Ошибка получения информации о белом списке: {e}")
+                info_lines.append(f"<b>👥 Белый список:</b> Ошибка загрузки")
             
-            # IP сервера
-            info_lines.append(f"<b>IP сервера:</b> {self.config.SERVER_IP}:{self.config.SERVER_PORT}")
+            # Сетевая информация
+            info_lines.append(f"<b>🌐 IP сервера:</b> {self.config.SERVER_IP}:{self.config.SERVER_PORT}")
             
             # Директория сервера (показываем реальный путь на хосте)
-            info_lines.append(f"<b>Директория:</b> /root/projects/mrok-minecraft-server")
+            info_lines.append(f"<b>📂 Директория:</b> /root/projects/mrok-minecraft-server")
             
         except Exception as e:
-            info_lines.append(f"<b>Ошибка получения информации:</b> {e}")
+            info_lines.append(f"<b>❌ Общая ошибка:</b> {e}")
             logger.error(f"Общая ошибка в get_server_info: {e}")
         
         return "\n".join(info_lines)
