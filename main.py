@@ -1203,7 +1203,7 @@ class MinecraftServerBot:
                 return
             
             # Проверяем, находимся ли мы в режиме добавления игрока
-            if message.reply_to_message and "никнейм игрока" in message.reply_to_message.text:
+            if message.reply_to_message and message.reply_to_message.text and "никнейм игрока" in message.reply_to_message.text:
                 player_name = message.text.strip()
                 
                 # Загружаем текущий белый список
@@ -1243,7 +1243,7 @@ class MinecraftServerBot:
                 return
             
             # Проверяем, находимся ли мы в режиме отправки сообщения
-            elif message.reply_to_message and "сообщение для отправки" in message.reply_to_message.text:
+            elif message.reply_to_message and message.reply_to_message.text and "сообщение для отправки" in message.reply_to_message.text:
                 text = message.text.strip()
                 success, result = self.execute_server_command(f"say {text}")
                 if success:
@@ -1259,7 +1259,7 @@ class MinecraftServerBot:
                 return
             
             # Проверяем, находимся ли мы в режиме ввода времени бэкапа
-            elif message.reply_to_message and "время для бэкапов" in message.reply_to_message.text:
+            elif message.reply_to_message and message.reply_to_message.text and "время для бэкапов" in message.reply_to_message.text:
                 time_text = message.text.strip()
                 
                 # Проверяем формат времени
@@ -1297,7 +1297,7 @@ class MinecraftServerBot:
                 return
             
             # Проверяем, находимся ли мы в режиме ввода количества бэкапов
-            elif message.reply_to_message and "количество бэкапов" in message.reply_to_message.text:
+            elif message.reply_to_message and message.reply_to_message.text and "количество бэкапов" in message.reply_to_message.text:
                 try:
                     count = int(message.text.strip())
                     
