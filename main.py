@@ -758,6 +758,93 @@ class MinecraftServerBot:
         
         return text
     
+    def get_logs_settings_keyboard(self) -> InlineKeyboardMarkup:
+        """Создает клавиатуру для настроек логов."""
+        builder = InlineKeyboardBuilder()
+        
+        # Статус автоотправки логов
+        status = "✅ Включена" if self.logs_settings.get("enabled", False) else "❌ Отключена"
+        builder.row(
+            InlineKeyboardButton(text=f"Автоотправка: {status}", callback_data="toggle_auto_logs")
+        )
+        
+        if self.logs_settings.get("enabled", False):
+            # Интервал
+            interval_text = {
+                "hourly": "Каждый час",
+                "daily": "Ежедневно",
+                "weekly": "Еженедельно"
+            }.get(self.logs_settings.get("interval", "daily"), "Ежедневно")
+            
+            builder.row(
+                InlineKeyboardButton(text=f"Интервал: {interval_text}", callback_data="set_logs_interval")
+            )
+            
+            # Время (только для daily/weekly)
+            if self.logs_settings.get("interval") in ["daily", "weekly"]:
+                builder.row(
+                    InlineKeyboardButton(text=f"Время: {self.logs_settings.get('time', '04:00')}", callback_data="set_logs_time")
+                )
+        
+        builder.row(
+            InlineKeyboardButton(text="📄 Отправить логи сейчас", callback_data="send_logs_now")
+        )
+        builder.row(
+            InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")
+        )
+        
+        return builder.as_markup()
+    
+    def get_logs_interval_keyboard(self) -> InlineKeyboardMarkup:
+        """Создает клавиатуру для выбора интервала отправки логов."""
+        builder = InlineKeyboardBuilder()
+        
+        intervals = [
+            ("hourly", "⏰ Каждый час"),
+            ("daily", "📅 Ежедневно"),
+            ("weekly", "📆 Еженедельно")
+        ]
+        
+        for interval_key, interval_name in intervals:
+            current = "✅ " if self.logs_settings.get("interval") == interval_key else ""
+            builder.row(
+                InlineKeyboardButton(text=f"{current}{interval_name}", callback_data=f"logs_interval_{interval_key}")
+            )
+        
+        builder.row(
+            InlineKeyboardButton(text="↩️ Назад", callback_data="logs_settings")
+        )
+        
+        return builder.as_markup()
+    
+    def _get_logs_settings_text(self) -> str:
+        """Возвращает текст с текущими настройками логов."""
+        status = "✅ Включена" if self.logs_settings.get("enabled", False) else "❌ Отключена"
+        
+        interval_text = {
+            "hourly": "Каждый час",
+            "daily": "Ежедневно", 
+            "weekly": "Еженедельно"
+        }.get(self.logs_settings.get("interval", "daily"), "Ежедневно")
+        
+        text = f"📋 <b>Настройки автоматической отправки логов</b>\n\n"
+        text += f"Статус: {status}\n"
+        
+        if self.logs_settings.get("enabled", False):
+            text += f"Интервал: {interval_text}\n"
+            
+            if self.logs_settings.get("interval") in ["daily", "weekly"]:
+                text += f"Время: {self.logs_settings.get('time', '04:00')}\n"
+            
+            chat_id = self.logs_settings.get("chat_id", self.config.BACKUP_CHAT_ID)
+            text += f"Чат для отправки: {chat_id}\n"
+            
+            # Показываем следующую запланированную отправку
+            if self.logs_job:
+                text += f"\n📅 Следующая отправка запланирована согласно расписанию"
+        
+        return text
+    
     def get_server_info(self) -> str:
         """Получает детальную информацию о сервере."""
         info_lines = [self.get_server_status()]
@@ -1051,6 +1138,7 @@ class MinecraftServerBot:
             InlineKeyboardButton(text="⚙️ Настройки бэкапов", callback_data="backup_settings"),
         )
         builder.row(
+            InlineKeyboardButton(text="📋 Настройки логов", callback_data="logs_settings"),
             InlineKeyboardButton(text="📢 Отправить сообщение", callback_data="send_message")
         )
         
@@ -1790,6 +1878,62 @@ class MinecraftServerBot:
             )
             await callback.answer()
         
+        # Обработчики настроек логов
+        @self.router.callback_query(F.data == "logs_settings")
+        async def callback_logs_settings(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            settings_text = self._get_logs_settings_text()
+            await callback.message.edit_text(
+                settings_text,
+                reply_markup=self.get_logs_settings_keyboard(),
+            )
+            await callback.answer()
+        
+        @self.router.callback_query(F.data == "send_logs_now")
+        async def callback_send_logs_now(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            await callback.message.edit_text("⏳ Создаю архив логов...")
+            
+            success, result, logs_path = self.create_logs_archive()
+            
+            if success and logs_path:
+                try:
+                    chat_id = self.logs_settings.get("chat_id", self.config.BACKUP_CHAT_ID)
+                    with open(logs_path, "rb") as file:
+                        await self.bot.send_document(
+                            chat_id=chat_id,
+                            document=types.BufferedInputFile(file.read(), filename=logs_path.name),
+                            caption=f"📋 Ручная отправка логов сервера\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{result}",
+                        )
+                    
+                    # Удаляем временный файл
+                    logs_path.unlink()
+                    
+                    await callback.message.edit_text(
+                        f"✅ Логи отправлены в чат {chat_id}",
+                        reply_markup=self.get_main_keyboard(),
+                    )
+                except Exception as e:
+                    if logs_path.exists():
+                        logs_path.unlink()
+                    await callback.message.edit_text(
+                        f"❌ Ошибка отправки логов: {e}",
+                        reply_markup=self.get_main_keyboard(),
+                    )
+            else:
+                await callback.message.edit_text(
+                    f"❌ {result}",
+                    reply_markup=self.get_main_keyboard(),
+                )
+            
+            await callback.answer()
+        
         # Обработчик текстовых сообщений
         @self.router.message(F.text)
         async def handle_text(message: Message):
@@ -1916,6 +2060,44 @@ class MinecraftServerBot:
                     )
                 return
             
+            # Проверяем, находимся ли мы в режиме ввода времени логов
+            elif message.reply_to_message and message.reply_to_message.text and "время для отправки логов" in message.reply_to_message.text:
+                time_text = message.text.strip()
+                
+                # Проверяем формат времени
+                try:
+                    time_parts = time_text.split(":")
+                    if len(time_parts) != 2:
+                        raise ValueError("Неверный формат")
+                    
+                    hour = int(time_parts[0])
+                    minute = int(time_parts[1])
+                    
+                    if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+                        raise ValueError("Неверное время")
+                    
+                    # Форматируем время
+                    formatted_time = f"{hour:02d}:{minute:02d}"
+                    
+                    self.logs_settings["time"] = formatted_time
+                    self.save_logs_settings()
+                    self.setup_auto_logs()
+                    
+                    await message.answer(
+                        f"✅ Время отправки логов установлено: {formatted_time}",
+                        reply_markup=self.get_logs_settings_keyboard(),
+                    )
+                    
+                except ValueError:
+                    await message.answer(
+                        "❌ Неверный формат времени!\n\n"
+                        "Используйте формат ЧЧ:ММ (например: 04:00 или 16:30)",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="↩️ Назад", callback_data="logs_settings")]
+                        ]),
+                    )
+                return
+            
             # Если это не ответ на запрос, показываем меню
             await message.answer(
                 "🤖 <b>Главное меню</b>\nВыберите действие:",
@@ -1940,6 +2122,8 @@ class MinecraftServerBot:
         finally:
             if self.backup_job:
                 self.backup_job.stop()
+            if self.logs_job:
+                self.logs_job.stop()
             await self.bot.session.close()
 
 

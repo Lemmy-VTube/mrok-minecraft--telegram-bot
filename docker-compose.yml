@@ -14,9 +14,9 @@ services:
       - /root/projects/mrok-minecraft-server/backups:/app/backups
       # Логи бота
       - ./logs:/app/logs
-      # Доступ к systemd для управления сервером
-      - /run/systemd/system:/run/systemd/system:ro
-      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
+      # Доступ к systemd для управления сервером (исправлено)
+      - /var/run/dbus:/var/run/dbus:ro
+      - /run/systemd:/run/systemd:ro
       # Доступ к журналам systemd
       - /var/log/journal:/var/log/journal:ro
     privileged: true
