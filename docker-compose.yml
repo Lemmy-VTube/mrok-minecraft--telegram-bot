@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  minecraft-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: minecraft-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Доступ к серверу Minecraft
+      - /root/projects/mrok-minecraft-server:/server:ro
+      # Директория для бэкапов
+      - /root/projects/mrok-minecraft-server/backups:/app/backups
+      # Логи бота
+      - ./logs:/app/logs
+      # Доступ к systemd для управления сервером
+      - /run/systemd/system:/run/systemd/system:ro
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
+      # Доступ к журналам systemd
+      - /var/log/journal:/var/log/journal:ro
+    privileged: true
+    network_mode: host
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
