@@ -183,34 +183,10 @@ class MinecraftServerBot:
             
             service_status = result.stdout.strip()
             
-            # Получаем дополнительную информацию о сервисе
-            status_result = subprocess.run(
-                ["systemctl", "show", self.config.SERVER_SERVICE, "--property=ActiveState,SubState,LoadState,MainPID"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            active_state = "unknown"
-            sub_state = "unknown"
-            load_state = "unknown"
-            main_pid = "0"
-            
-            if status_result.returncode == 0:
-                for line in status_result.stdout.split('\n'):
-                    if line.startswith('ActiveState='):
-                        active_state = line.split('=', 1)[1]
-                    elif line.startswith('SubState='):
-                        sub_state = line.split('=', 1)[1]
-                    elif line.startswith('LoadState='):
-                        load_state = line.split('=', 1)[1]
-                    elif line.startswith('MainPID='):
-                        main_pid = line.split('=', 1)[1]
-            
-            # Формируем подробный статус
-            if active_state == "active" and sub_state == "running":
+            # Формируем статус на основе простой проверки
+            if service_status == "active":
                 status_icon = "🟢"
-                status_text = "Запущен и работает"
+                status_text = "Запущен"
                 
                 # Проверяем, отвечает ли сервер на порту
                 try:
@@ -221,51 +197,56 @@ class MinecraftServerBot:
                     sock.close()
                     
                     if result == 0:
-                        status_text += " (порт доступен)"
+                        status_text += " и доступен"
                     else:
                         status_text += " (порт недоступен)"
                 except Exception:
-                    status_text += " (проверка порта недоступна)"
+                    pass
                     
-            elif active_state == "inactive":
+            elif service_status == "inactive":
                 status_icon = "🔴"
                 status_text = "Остановлен"
-            elif active_state == "failed":
+            elif service_status == "failed":
                 status_icon = "❌"
                 status_text = "Ошибка запуска"
-            elif active_state == "activating":
-                status_icon = "🟡"
-                status_text = "Запускается..."
-            elif active_state == "deactivating":
-                status_icon = "🟡"
-                status_text = "Останавливается..."
             else:
-                status_icon = "⚪"
-                status_text = f"Неизвестно ({active_state}/{sub_state})"
-            
-            # Добавляем информацию о процессе
-            process_info = ""
-            if main_pid != "0":
+                # Получаем дополнительную информацию только если статус неясен
                 try:
-                    # Получаем информацию о процессе
-                    ps_result = subprocess.run(
-                        ["ps", "-p", main_pid, "-o", "pid,ppid,etime,pcpu,pmem,cmd", "--no-headers"],
+                    status_result = subprocess.run(
+                        ["systemctl", "show", self.config.SERVER_SERVICE, "--property=ActiveState,SubState,MainPID"],
                         capture_output=True,
                         text=True,
                         timeout=5
                     )
                     
-                    if ps_result.returncode == 0:
-                        ps_line = ps_result.stdout.strip()
-                        if ps_line:
-                            parts = ps_line.split(None, 5)
-                            if len(parts) >= 5:
-                                pid, ppid, etime, cpu, mem = parts[:5]
-                                process_info = f"\n<b>PID:</b> {pid} | <b>Время работы:</b> {etime}\n<b>CPU:</b> {cpu}% | <b>Память:</b> {mem}%"
-                except Exception as e:
-                    logger.error(f"Ошибка получения информации о процессе: {e}")
+                    active_state = "unknown"
+                    sub_state = "unknown"
+                    main_pid = "0"
+                    
+                    if status_result.returncode == 0:
+                        for line in status_result.stdout.split('\n'):
+                            if line.startswith('ActiveState='):
+                                active_state = line.split('=', 1)[1]
+                            elif line.startswith('SubState='):
+                                sub_state = line.split('=', 1)[1]
+                            elif line.startswith('MainPID='):
+                                main_pid = line.split('=', 1)[1]
+                    
+                    if active_state == "activating":
+                        status_icon = "🟡"
+                        status_text = "Запускается..."
+                    elif active_state == "deactivating":
+                        status_icon = "🟡"
+                        status_text = "Останавливается..."
+                    else:
+                        status_icon = "⚪"
+                        status_text = f"Неопределен ({service_status})"
+                        
+                except Exception:
+                    status_icon = "⚪"
+                    status_text = f"Неопределен ({service_status})"
             
-            return f"{status_icon} <b>Сервер: {status_text}</b>{process_info}"
+            return f"{status_icon} <b>Сервер: {status_text}</b>"
             
         except Exception as e:
             logger.error(f"Ошибка получения статуса сервера: {e}")
@@ -995,26 +976,13 @@ class MinecraftServerBot:
                 logger.error(f"Ошибка получения информации о Java: {e}")
                 info_lines.append(f"<b>☕ Java:</b> Ошибка проверки")
             
-            # Белый список и онлайн игроки
+            # Белый список
             try:
                 whitelist = self.load_whitelist()
-                online_count, online_players = self.get_online_players_info()
-                
                 info_lines.append(f"<b>👥 Белый список:</b> {len(whitelist)} игроков")
-                
-                if online_count > 0:
-                    players_text = ", ".join(online_players[:5])  # Показываем первых 5 игроков
-                    if len(online_players) > 5:
-                        players_text += f" и еще {len(online_players) - 5}"
-                    info_lines.append(f"<b>🎮 Онлайн:</b> {online_count} игроков")
-                    info_lines.append(f"<b>👤 Игроки:</b> {players_text}")
-                else:
-                    info_lines.append(f"<b>🎮 Онлайн:</b> Нет игроков")
-                    
             except Exception as e:
-                logger.error(f"Ошибка получения информации о белом списке/игроках: {e}")
+                logger.error(f"Ошибка получения информации о белом списке: {e}")
                 info_lines.append(f"<b>👥 Белый список:</b> Ошибка загрузки")
-                info_lines.append(f"<b>🎮 Онлайн:</b> Ошибка получения")
             
             # Сетевая информация
             info_lines.append(f"<b>🌐 IP сервера:</b> {self.config.SERVER_IP}:{self.config.SERVER_PORT}")
@@ -1127,7 +1095,7 @@ class MinecraftServerBot:
         )
         builder.row(
             InlineKeyboardButton(text="📜 Логи сервера", callback_data="server_logs"),
-            InlineKeyboardButton(text="🔍 Статус сервиса", callback_data="service_status"),
+            InlineKeyboardButton(text="🎮 Онлайн игроки", callback_data="online_players"),
         )
         builder.row(
             InlineKeyboardButton(text="⚙️ Управление", callback_data="server_control"),
