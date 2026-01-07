@@ -57,6 +57,12 @@ class Config(BaseSettings):
     AUTO_BACKUP_TIME: str = "03:00"  # Время для daily/weekly бэкапов
     AUTO_BACKUP_KEEP_COUNT: int = 7  # Количество бэкапов для хранения
     
+    # Настройки автоотправки логов
+    AUTO_LOGS_ENABLED: bool = False
+    AUTO_LOGS_INTERVAL: str = "daily"  # daily, weekly, hourly
+    AUTO_LOGS_TIME: str = "04:00"  # Время для daily/weekly отправки логов
+    AUTO_LOGS_CHAT_ID: Optional[int] = None  # Чат для отправки логов (по умолчанию BACKUP_CHAT_ID)
+    
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "%(asctime)s - [%(levelname)s] - %(name)s: %(message)s"
     LOG_DATE_FORMAT: str = "%d.%m.%Y %H:%M:%S"
@@ -116,6 +122,15 @@ class MinecraftServerBot:
         }
         self.backup_job = None
         
+        # Настройки автоотправки логов
+        self.logs_settings = {
+            "enabled": self.config.AUTO_LOGS_ENABLED,
+            "interval": self.config.AUTO_LOGS_INTERVAL,
+            "time": self.config.AUTO_LOGS_TIME,
+            "chat_id": self.config.AUTO_LOGS_CHAT_ID or self.config.BACKUP_CHAT_ID
+        }
+        self.logs_job = None
+        
         # Инициализация бота
         self.bot = Bot(
             token=config.TOKEN_BOT.get_secret_value(),
@@ -156,22 +171,175 @@ class MinecraftServerBot:
             return False
     
     def get_server_status(self) -> str:
-        """Получает статус сервера."""
+        """Получает подробный статус сервера."""
         try:
+            # Проверяем статус через systemctl
             result = subprocess.run(
                 ["systemctl", "is-active", self.config.SERVER_SERVICE],
                 capture_output=True,
                 text=True,
+                timeout=5
             )
-            status = result.stdout.strip()
-            if status == "active":
-                return "🟢 <b>Сервер запущен</b>"
-            elif status == "inactive":
-                return "🔴 <b>Сервер остановлен</b>"
+            
+            service_status = result.stdout.strip()
+            
+            # Получаем дополнительную информацию о сервисе
+            status_result = subprocess.run(
+                ["systemctl", "show", self.config.SERVER_SERVICE, "--property=ActiveState,SubState,LoadState,MainPID"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            active_state = "unknown"
+            sub_state = "unknown"
+            load_state = "unknown"
+            main_pid = "0"
+            
+            if status_result.returncode == 0:
+                for line in status_result.stdout.split('\n'):
+                    if line.startswith('ActiveState='):
+                        active_state = line.split('=', 1)[1]
+                    elif line.startswith('SubState='):
+                        sub_state = line.split('=', 1)[1]
+                    elif line.startswith('LoadState='):
+                        load_state = line.split('=', 1)[1]
+                    elif line.startswith('MainPID='):
+                        main_pid = line.split('=', 1)[1]
+            
+            # Формируем подробный статус
+            if active_state == "active" and sub_state == "running":
+                status_icon = "🟢"
+                status_text = "Запущен и работает"
+                
+                # Проверяем, отвечает ли сервер на порту
+                try:
+                    import socket
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(3)
+                    result = sock.connect_ex(('localhost', self.config.SERVER_PORT))
+                    sock.close()
+                    
+                    if result == 0:
+                        status_text += " (порт доступен)"
+                    else:
+                        status_text += " (порт недоступен)"
+                except Exception:
+                    status_text += " (проверка порта недоступна)"
+                    
+            elif active_state == "inactive":
+                status_icon = "🔴"
+                status_text = "Остановлен"
+            elif active_state == "failed":
+                status_icon = "❌"
+                status_text = "Ошибка запуска"
+            elif active_state == "activating":
+                status_icon = "🟡"
+                status_text = "Запускается..."
+            elif active_state == "deactivating":
+                status_icon = "🟡"
+                status_text = "Останавливается..."
             else:
-                return f"🟡 <b>Сервер: {status}</b>"
+                status_icon = "⚪"
+                status_text = f"Неизвестно ({active_state}/{sub_state})"
+            
+            # Добавляем информацию о процессе
+            process_info = ""
+            if main_pid != "0":
+                try:
+                    # Получаем информацию о процессе
+                    ps_result = subprocess.run(
+                        ["ps", "-p", main_pid, "-o", "pid,ppid,etime,pcpu,pmem,cmd", "--no-headers"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    
+                    if ps_result.returncode == 0:
+                        ps_line = ps_result.stdout.strip()
+                        if ps_line:
+                            parts = ps_line.split(None, 5)
+                            if len(parts) >= 5:
+                                pid, ppid, etime, cpu, mem = parts[:5]
+                                process_info = f"\n<b>PID:</b> {pid} | <b>Время работы:</b> {etime}\n<b>CPU:</b> {cpu}% | <b>Память:</b> {mem}%"
+                except Exception as e:
+                    logger.error(f"Ошибка получения информации о процессе: {e}")
+            
+            return f"{status_icon} <b>Сервер: {status_text}</b>{process_info}"
+            
         except Exception as e:
+            logger.error(f"Ошибка получения статуса сервера: {e}")
             return f"❌ <b>Ошибка получения статуса:</b> {e}"
+    
+    def get_online_players_info(self) -> Tuple[int, List[str]]:
+        """Получает информацию об онлайн игроках."""
+        try:
+            # Метод 1: Попробуем через RCON
+            rcon_success, rcon_result = self._try_rcon_command("list")
+            if rcon_success and "RCON:" in rcon_result:
+                # Парсим ответ RCON
+                rcon_output = rcon_result.replace("RCON: ", "")
+                if "players online:" in rcon_output.lower():
+                    # Формат: "There are 2/20 players online: Player1, Player2"
+                    parts = rcon_output.split(":")
+                    if len(parts) >= 2:
+                        count_part = parts[0].strip()
+                        players_part = parts[1].strip() if len(parts) > 1 else ""
+                        
+                        # Извлекаем количество игроков
+                        import re
+                        count_match = re.search(r'(\d+)/\d+', count_part)
+                        online_count = int(count_match.group(1)) if count_match else 0
+                        
+                        # Извлекаем список игроков
+                        players = []
+                        if players_part and players_part != "":
+                            players = [p.strip() for p in players_part.split(",") if p.strip()]
+                        
+                        return online_count, players
+            
+            # Метод 2: Попробуем через анализ логов
+            try:
+                logs_text = self.get_logs(100)
+                online_count = 0
+                players = []
+                
+                # Ищем последние сообщения о входе/выходе игроков
+                import re
+                login_pattern = r'(\w+) joined the game'
+                logout_pattern = r'(\w+) left the game'
+                
+                logged_in = set()
+                
+                for line in logs_text.split('\n'):
+                    login_match = re.search(login_pattern, line)
+                    logout_match = re.search(logout_pattern, line)
+                    
+                    if login_match:
+                        logged_in.add(login_match.group(1))
+                    elif logout_match:
+                        logged_in.discard(logout_match.group(1))
+                
+                return len(logged_in), list(logged_in)
+                
+            except Exception as e:
+                logger.error(f"Ошибка анализа логов для получения игроков: {e}")
+            
+            # Метод 3: Проверяем файлы сессий (если есть)
+            try:
+                playerdata_dir = self.server_dir / "world" / "playerdata"
+                if playerdata_dir.exists():
+                    # Это приблизительная оценка, не точная информация об онлайне
+                    player_files = list(playerdata_dir.glob("*.dat"))
+                    return 0, []  # Не можем точно определить онлайн через файлы
+            except Exception as e:
+                logger.error(f"Ошибка проверки файлов игроков: {e}")
+            
+            return 0, []
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения информации об игроках: {e}")
+            return 0, []
     
     def execute_server_command(self, command: str) -> Tuple[bool, str]:
         """Выполняет команду на сервере через RCON или файл команд."""
@@ -263,6 +431,30 @@ class MinecraftServerBot:
             logger.error(f"Ошибка загрузки настроек бэкапа: {e}")
             return False
     
+    def save_logs_settings(self) -> bool:
+        """Сохраняет настройки автоотправки логов в файл."""
+        try:
+            settings_file = ROOT_DIR / "logs_settings.json"
+            with open(settings_file, "w", encoding="utf-8") as f:
+                json.dump(self.logs_settings, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения настроек логов: {e}")
+            return False
+    
+    def load_logs_settings(self) -> bool:
+        """Загружает настройки автоотправки логов из файла."""
+        try:
+            settings_file = ROOT_DIR / "logs_settings.json"
+            if settings_file.exists():
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    self.logs_settings = json.load(f)
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка загрузки настроек логов: {e}")
+            return False
+    
     def cleanup_old_backups(self):
         """Удаляет старые бэкапы, оставляя только указанное количество."""
         try:
@@ -276,6 +468,133 @@ class MinecraftServerBot:
                     logger.info(f"Удален старый бэкап: {old_backup.name}")
         except Exception as e:
             logger.error(f"Ошибка очистки старых бэкапов: {e}")
+    
+    def create_logs_archive(self) -> Tuple[bool, str, Optional[Path]]:
+        """Создает архив с логами сервера."""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logs_name = f"server_logs_{timestamp}.tar.gz"
+            logs_path = Path("/app") / logs_name
+            
+            # Собираем все возможные файлы логов
+            log_files_to_archive = []
+            
+            # Основные логи сервера
+            possible_log_paths = [
+                self.server_dir / "logs",
+                self.server_dir / "crash-reports",
+                self.server_dir / "debug",
+            ]
+            
+            # Отдельные файлы логов
+            possible_log_files = [
+                self.server_dir / "server.log",
+                self.server_dir / "minecraft_server.log",
+                self.server_dir / "forge.log",
+            ]
+            
+            with tarfile.open(logs_path, "w:gz") as tar:
+                # Добавляем директории с логами
+                for log_path in possible_log_paths:
+                    if log_path.exists():
+                        tar.add(log_path, arcname=log_path.name)
+                        log_files_to_archive.append(str(log_path.name))
+                
+                # Добавляем отдельные файлы логов
+                for log_file in possible_log_files:
+                    if log_file.exists():
+                        tar.add(log_file, arcname=log_file.name)
+                        log_files_to_archive.append(str(log_file.name))
+                
+                # Добавляем логи из systemd journal
+                try:
+                    journal_result = subprocess.run(
+                        ["journalctl", "-u", self.config.SERVER_SERVICE, "--no-pager", "-o", "short"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    if journal_result.returncode == 0 and journal_result.stdout.strip():
+                        journal_file = Path("/app") / f"systemd_journal_{timestamp}.log"
+                        with open(journal_file, "w", encoding="utf-8") as f:
+                            f.write(journal_result.stdout)
+                        tar.add(journal_file, arcname=journal_file.name)
+                        journal_file.unlink()  # Удаляем временный файл
+                        log_files_to_archive.append("systemd journal")
+                except Exception as e:
+                    logger.error(f"Ошибка получения журнала systemd: {e}")
+            
+            if not log_files_to_archive:
+                return False, "Файлы логов не найдены", None
+            
+            return True, f"Архив логов создан: {logs_name} (файлы: {', '.join(log_files_to_archive)})", logs_path
+            
+        except Exception as e:
+            return False, f"Ошибка создания архива логов: {e}", None
+    
+    async def auto_logs_task(self):
+        """Задача автоматической отправки логов."""
+        try:
+            logger.info("Выполняется автоматическая отправка логов...")
+            success, result, logs_path = self.create_logs_archive()
+            
+            if success and logs_path:
+                # Отправляем в чат для логов
+                try:
+                    chat_id = self.logs_settings.get("chat_id", self.config.BACKUP_CHAT_ID)
+                    with open(logs_path, "rb") as file:
+                        await self.bot.send_document(
+                            chat_id=chat_id,
+                            document=types.BufferedInputFile(file.read(), filename=logs_path.name),
+                            caption=f"📋 Автоматическая отправка логов сервера\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{result}",
+                        )
+                    
+                    # Удаляем временный файл
+                    logs_path.unlink()
+                    logger.info(f"Автоотправка логов успешно выполнена: {logs_path.name}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки автологов: {e}")
+                    # Удаляем файл даже при ошибке отправки
+                    if logs_path.exists():
+                        logs_path.unlink()
+            else:
+                logger.error(f"Ошибка создания архива логов: {result}")
+        except Exception as e:
+            logger.error(f"Ошибка в задаче автоотправки логов: {e}")
+    
+    def setup_auto_logs(self):
+        """Настраивает автоматическую отправку логов."""
+        # Останавливаем предыдущую задачу если есть
+        if self.logs_job:
+            self.logs_job.stop()
+            self.logs_job = None
+        
+        if not self.logs_settings.get("enabled", False):
+            logger.info("Автоотправка логов отключена")
+            return
+        
+        interval = self.logs_settings.get("interval", "daily")
+        logs_time = self.logs_settings.get("time", "04:00")
+        
+        try:
+            if interval == "hourly":
+                # Каждый час
+                self.logs_job = aiocron.crontab('0 * * * *', func=self.auto_logs_task)
+            elif interval == "daily":
+                # Каждый день в указанное время
+                hour, minute = logs_time.split(":")
+                self.logs_job = aiocron.crontab(f'{minute} {hour} * * *', func=self.auto_logs_task)
+            elif interval == "weekly":
+                # Каждую неделю в воскресенье в указанное время
+                hour, minute = logs_time.split(":")
+                self.logs_job = aiocron.crontab(f'{minute} {hour} * * 0', func=self.auto_logs_task)
+            
+            if self.logs_job:
+                logger.info(f"Автоотправка логов настроена: {interval} в {logs_time if interval in ['daily', 'weekly'] else 'по расписанию'}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка настройки автоотправки логов: {e}")
     
     async def auto_backup_task(self):
         """Задача автоматического бэкапа."""
@@ -589,13 +908,26 @@ class MinecraftServerBot:
                 logger.error(f"Ошибка получения информации о Java: {e}")
                 info_lines.append(f"<b>☕ Java:</b> Ошибка проверки")
             
-            # Белый список
+            # Белый список и онлайн игроки
             try:
                 whitelist = self.load_whitelist()
+                online_count, online_players = self.get_online_players_info()
+                
                 info_lines.append(f"<b>👥 Белый список:</b> {len(whitelist)} игроков")
+                
+                if online_count > 0:
+                    players_text = ", ".join(online_players[:5])  # Показываем первых 5 игроков
+                    if len(online_players) > 5:
+                        players_text += f" и еще {len(online_players) - 5}"
+                    info_lines.append(f"<b>🎮 Онлайн:</b> {online_count} игроков")
+                    info_lines.append(f"<b>👤 Игроки:</b> {players_text}")
+                else:
+                    info_lines.append(f"<b>🎮 Онлайн:</b> Нет игроков")
+                    
             except Exception as e:
-                logger.error(f"Ошибка получения информации о белом списке: {e}")
+                logger.error(f"Ошибка получения информации о белом списке/игроках: {e}")
                 info_lines.append(f"<b>👥 Белый список:</b> Ошибка загрузки")
+                info_lines.append(f"<b>🎮 Онлайн:</b> Ошибка получения")
             
             # Сетевая информация
             info_lines.append(f"<b>🌐 IP сервера:</b> {self.config.SERVER_IP}:{self.config.SERVER_PORT}")
@@ -917,6 +1249,7 @@ class MinecraftServerBot:
                 "/start - Начальное меню\n"
                 "/status - Статус сервера\n"
                 "/info - Информация о сервере\n"
+                "/online - Список онлайн игроков\n"
                 "/logs [количество] - Логи сервера (по умолчанию 50 строк)\n"
                 "/whitelist - Управление белым списком\n"
                 "/backup - Создать бэкап мира\n"
@@ -942,6 +1275,22 @@ class MinecraftServerBot:
             )
             await message.answer(help_text)
         
+        @self.router.message(Command("online"))
+        async def cmd_online(message: Message):
+            if not self.is_admin(message.from_user.id):
+                await message.answer("⛔ У вас нет доступа к этой команде.")
+                return
+            
+            online_count, online_players = self.get_online_players_info()
+            
+            if online_count > 0:
+                players_list = "\n".join([f"• {player}" for player in online_players])
+                online_text = f"🎮 <b>Игроков онлайн: {online_count}</b>\n\n{players_list}"
+            else:
+                online_text = "🎮 <b>Игроков онлайн: 0</b>\n\nСервер пуст"
+            
+            await message.answer(online_text)
+        
         # Обработчики кнопок
         @self.router.callback_query(F.data == "server_status")
         async def callback_server_status(callback: CallbackQuery):
@@ -961,6 +1310,23 @@ class MinecraftServerBot:
             
             info_text = self.get_server_info()
             await callback.message.edit_text(info_text, reply_markup=self.get_main_keyboard())
+            await callback.answer()
+        
+        @self.router.callback_query(F.data == "online_players")
+        async def callback_online_players(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            online_count, online_players = self.get_online_players_info()
+            
+            if online_count > 0:
+                players_list = "\n".join([f"• {player}" for player in online_players])
+                online_text = f"🎮 <b>Игроков онлайн: {online_count}</b>\n\n{players_list}"
+            else:
+                online_text = "🎮 <b>Игроков онлайн: 0</b>\n\nСервер пуст"
+            
+            await callback.message.edit_text(online_text, reply_markup=self.get_main_keyboard())
             await callback.answer()
         
         @self.router.callback_query(F.data == "server_logs")
@@ -1559,9 +1925,12 @@ class MinecraftServerBot:
     async def start_polling(self):
         """Запуск бота."""
         logger.info("Запуск Minecraft Server Bot...")
+        # Обновляем метод start_polling для загрузки настроек логов
         self.load_whitelist()
         self.load_backup_settings()
+        self.load_logs_settings()
         self.setup_auto_backup()
+        self.setup_auto_logs()
         
         try:
             await self.bot.delete_webhook()
