@@ -1,11 +1,12 @@
 FROM python:3.13.7
 
-# Устанавливаем системные зависимости для работы с systemd
+# Устанавливаем системные зависимости для работы с systemd и Java
 RUN apt-get update && apt-get install -y \
     systemd \
     dbus \
     procps \
     sudo \
+    openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
 # Устанавливаем uv

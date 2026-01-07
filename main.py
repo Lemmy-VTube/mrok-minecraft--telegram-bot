@@ -446,37 +446,70 @@ class MinecraftServerBot:
         try:
             # Ядро системы
             try:
-                kernel = subprocess.run(["uname", "-r"], capture_output=True, text=True, timeout=5).stdout.strip()
-                info_lines.append(f"<b>Ядро системы:</b> {kernel}")
+                kernel_result = subprocess.run(["uname", "-r"], capture_output=True, text=True, timeout=5)
+                if kernel_result.returncode == 0:
+                    kernel = kernel_result.stdout.strip()
+                    info_lines.append(f"<b>Ядро системы:</b> {kernel}")
+                else:
+                    info_lines.append(f"<b>Ядро системы:</b> Недоступно")
+            except FileNotFoundError:
+                info_lines.append(f"<b>Ядро системы:</b> Команда uname не найдена")
             except Exception as e:
                 logger.error(f"Ошибка получения информации о ядре: {e}")
+                info_lines.append(f"<b>Ядро системы:</b> Ошибка получения")
             
             # Java версия
             try:
                 java = subprocess.run(["java", "-version"], capture_output=True, text=True, timeout=5)
-                # Java выводит версию в stderr, поэтому используем stderr
-                java_output = java.stderr if java.stderr else java.stdout
-                java_lines = java_output.strip().split("\n")
-                if java_lines:
-                    info_lines.append(f"<b>Java:</b> {java_lines[0]}")
+                if java.returncode == 0:
+                    # Java выводит версию в stderr, поэтому используем stderr
+                    java_output = java.stderr if java.stderr else java.stdout
+                    java_lines = java_output.strip().split("\n")
+                    if java_lines:
+                        info_lines.append(f"<b>Java:</b> {java_lines[0]}")
+                else:
+                    info_lines.append(f"<b>Java:</b> Не установлена")
+            except FileNotFoundError:
+                info_lines.append(f"<b>Java:</b> Не найдена")
             except Exception as e:
                 logger.error(f"Ошибка получения информации о Java: {e}")
+                info_lines.append(f"<b>Java:</b> Ошибка проверки")
             
             # Загрузка CPU и памяти
             try:
-                memory = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5).stdout.strip().split("\n")[1]
-                memory_info = " ".join(memory.split()[1:4])
-                info_lines.append(f"<b>Память:</b> {memory_info}")
+                memory_result = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
+                if memory_result.returncode == 0:
+                    memory_lines = memory_result.stdout.strip().split("\n")
+                    if len(memory_lines) > 1:
+                        memory_info = " ".join(memory_lines[1].split()[1:4])
+                        info_lines.append(f"<b>Память:</b> {memory_info}")
+                    else:
+                        info_lines.append(f"<b>Память:</b> Недоступно")
+                else:
+                    info_lines.append(f"<b>Память:</b> Ошибка получения")
+            except FileNotFoundError:
+                info_lines.append(f"<b>Память:</b> Команда free не найдена")
             except Exception as e:
                 logger.error(f"Ошибка получения информации о памяти: {e}")
+                info_lines.append(f"<b>Память:</b> Ошибка получения")
             
             # Дисковое пространство
             try:
-                disk = subprocess.run(["df", "-h", "/server"], capture_output=True, text=True, timeout=5).stdout.strip().split("\n")[1]
-                disk_info = " ".join(disk.split()[1:5])
-                info_lines.append(f"<b>Диск:</b> {disk_info}")
+                disk_result = subprocess.run(["df", "-h", "/server"], capture_output=True, text=True, timeout=5)
+                if disk_result.returncode == 0:
+                    disk_lines = disk_result.stdout.strip().split("\n")
+                    if len(disk_lines) > 1:
+                        disk_info = " ".join(disk_lines[1].split()[1:5])
+                        info_lines.append(f"<b>Диск:</b> {disk_info}")
+                    else:
+                        info_lines.append(f"<b>Диск:</b> Недоступно")
+                else:
+                    info_lines.append(f"<b>Диск:</b> Ошибка получения")
+            except FileNotFoundError:
+                info_lines.append(f"<b>Диск:</b> Команда df не найдена")
             except Exception as e:
                 logger.error(f"Ошибка получения информации о диске: {e}")
+                info_lines.append(f"<b>Диск:</b> Ошибка получения")
             
             # Белый список
             try:
