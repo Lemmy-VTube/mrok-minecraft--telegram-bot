@@ -181,14 +181,17 @@ class MinecraftServerBot:
             if rcon_result[0]:
                 return rcon_result
             
-            # Метод 2: Создаем файл команд для сервера
-            # Этот метод работает, если сервер настроен на чтение команд из файла
-            command_file = self.server_dir / "server_commands.txt"
+            # Метод 2: Создаем файл команд в директории бота (не в read-only директории сервера)
+            command_file = Path("/app/server_commands.txt")
             try:
                 with open(command_file, "a", encoding="utf-8") as f:
                     f.write(f"{command}\n")
                 logger.info(f"Команда записана в файл: {command}")
-                return True, f"Команда '{command}' записана в файл команд"
+                
+                # Для systemd сервисов команды нужно отправлять через другие методы
+                # Пока что просто логируем команду
+                logger.info(f"Команда для сервера: {command}")
+                return True, f"Команда '{command}' записана (требуется настройка RCON для прямой отправки)"
             except Exception as e:
                 logger.error(f"Ошибка записи команды в файл: {e}")
                 return False, f"Ошибка записи команды: {e}"
@@ -221,13 +224,17 @@ class MinecraftServerBot:
             if not rcon_enabled or not rcon_password:
                 return False, "RCON не настроен"
             
-            # Здесь можно добавить реальную RCON библиотеку
-            # Например: from mcrcon import MCRcon
-            # with MCRcon("localhost", rcon_password, port=rcon_port) as mcr:
-            #     response = mcr.command(command)
-            #     return True, f"RCON: {response}"
-            
-            return False, "RCON библиотека не установлена"
+            # Используем RCON библиотеку
+            try:
+                from mcrcon import MCRcon
+                with MCRcon("localhost", rcon_password, port=rcon_port) as mcr:
+                    response = mcr.command(command)
+                    logger.info(f"RCON команда выполнена: {command} -> {response}")
+                    return True, f"RCON: {response}"
+            except ImportError:
+                return False, "RCON библиотека не установлена"
+            except Exception as rcon_error:
+                return False, f"Ошибка RCON соединения: {rcon_error}"
             
         except Exception as e:
             return False, f"Ошибка RCON: {e}"
@@ -438,28 +445,45 @@ class MinecraftServerBot:
         
         try:
             # Ядро системы
-            kernel = subprocess.run(["uname", "-r"], capture_output=True, text=True).stdout.strip()
-            info_lines.append(f"<b>Ядро системы:</b> {kernel}")
+            try:
+                kernel = subprocess.run(["uname", "-r"], capture_output=True, text=True, timeout=5).stdout.strip()
+                info_lines.append(f"<b>Ядро системы:</b> {kernel}")
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о ядре: {e}")
             
             # Java версия
-            java = subprocess.run(["java", "-version"], capture_output=True, text=True, stderr=subprocess.STDOUT)
-            java_lines = java.stdout.strip().split("\n")
-            if java_lines:
-                info_lines.append(f"<b>Java:</b> {java_lines[0]}")
+            try:
+                java = subprocess.run(["java", "-version"], capture_output=True, text=True, timeout=5)
+                # Java выводит версию в stderr, поэтому используем stderr
+                java_output = java.stderr if java.stderr else java.stdout
+                java_lines = java_output.strip().split("\n")
+                if java_lines:
+                    info_lines.append(f"<b>Java:</b> {java_lines[0]}")
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о Java: {e}")
             
             # Загрузка CPU и памяти
-            memory = subprocess.run(["free", "-h"], capture_output=True, text=True).stdout.strip().split("\n")[1]
-            memory_info = " ".join(memory.split()[1:4])
-            info_lines.append(f"<b>Память:</b> {memory_info}")
+            try:
+                memory = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5).stdout.strip().split("\n")[1]
+                memory_info = " ".join(memory.split()[1:4])
+                info_lines.append(f"<b>Память:</b> {memory_info}")
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о памяти: {e}")
             
             # Дисковое пространство
-            disk = subprocess.run(["df", "-h", "/server"], capture_output=True, text=True).stdout.strip().split("\n")[1]
-            disk_info = " ".join(disk.split()[1:5])
-            info_lines.append(f"<b>Диск:</b> {disk_info}")
+            try:
+                disk = subprocess.run(["df", "-h", "/server"], capture_output=True, text=True, timeout=5).stdout.strip().split("\n")[1]
+                disk_info = " ".join(disk.split()[1:5])
+                info_lines.append(f"<b>Диск:</b> {disk_info}")
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о диске: {e}")
             
             # Белый список
-            whitelist = self.load_whitelist()
-            info_lines.append(f"<b>Игроков в белом списке:</b> {len(whitelist)}")
+            try:
+                whitelist = self.load_whitelist()
+                info_lines.append(f"<b>Игроков в белом списке:</b> {len(whitelist)}")
+            except Exception as e:
+                logger.error(f"Ошибка получения информации о белом списке: {e}")
             
             # IP сервера
             info_lines.append(f"<b>IP сервера:</b> {self.config.SERVER_IP}:{self.config.SERVER_PORT}")
@@ -469,6 +493,7 @@ class MinecraftServerBot:
             
         except Exception as e:
             info_lines.append(f"<b>Ошибка получения информации:</b> {e}")
+            logger.error(f"Общая ошибка в get_server_info: {e}")
         
         return "\n".join(info_lines)
     
@@ -749,12 +774,12 @@ class MinecraftServerBot:
                 "list - Список игроков\n\n"
                 "<b>Управление через кнопки:</b>\n"
                 "Используйте кнопки в меню для быстрого доступа к функциям.\n\n"
-                "<b>Настройка RCON (рекомендуется):</b>\n"
-                "Добавьте в server.properties:\n"
+                "<b>⚠️ Важно - Настройка RCON:</b>\n"
+                "Для отправки команд на сервер добавьте в server.properties:\n"
                 "enable-rcon=true\n"
                 "rcon.port=25575\n"
-                "rcon.password=your_password\n"
-                "Это позволит боту отправлять команды напрямую на сервер."
+                "rcon.password=your_secure_password\n"
+                "Без RCON команды только логируются, но не выполняются на сервере."
             )
             await message.answer(help_text)
         
