@@ -13,11 +13,12 @@ import logging
 import subprocess
 import sys
 import tarfile
-from datetime import datetime
+from datetime import datetime, time
 from logging import getLogger
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import aiocron
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -49,6 +50,12 @@ class Config(BaseSettings):
     SERVER_IP: str = "195.10.205.59"
     SERVER_PORT: int = 25565
     SERVER_SERVICE: str = "minecraft-forge.service"
+    
+    # Настройки автобэкапов
+    AUTO_BACKUP_ENABLED: bool = False
+    AUTO_BACKUP_INTERVAL: str = "daily"  # daily, weekly, hourly, 15min, 30min
+    AUTO_BACKUP_TIME: str = "03:00"  # Время для daily/weekly бэкапов
+    AUTO_BACKUP_KEEP_COUNT: int = 7  # Количество бэкапов для хранения
     
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "%(asctime)s - [%(levelname)s] - %(name)s: %(message)s"
@@ -87,8 +94,8 @@ class ColorFormatter(logging.Formatter):
 class MinecraftServerBot:
     def __init__(self, config: Config):
         self.config = config
-        self.server_dir = Path("/root/projects/mrok-minecraft-server")
-        self.backup_dir = self.server_dir / "backups"
+        self.server_dir = Path("/server")  # Путь внутри контейнера
+        self.backup_dir = Path("/app/backups")  # Путь внутри контейнера
         self.backup_dir.mkdir(exist_ok=True)
         
         # Файлы сервера
@@ -99,6 +106,15 @@ class MinecraftServerBot:
         
         # Кэш белого списка
         self.whitelist_cache: List[Dict] = []
+        
+        # Настройки автобэкапов
+        self.backup_settings = {
+            "enabled": self.config.AUTO_BACKUP_ENABLED,
+            "interval": self.config.AUTO_BACKUP_INTERVAL,
+            "time": self.config.AUTO_BACKUP_TIME,
+            "keep_count": self.config.AUTO_BACKUP_KEEP_COUNT
+        }
+        self.backup_job = None
         
         # Инициализация бота
         self.bot = Bot(
@@ -216,6 +232,206 @@ class MinecraftServerBot:
         except Exception as e:
             return False, f"Ошибка RCON: {e}"
     
+    def save_backup_settings(self) -> bool:
+        """Сохраняет настройки автобэкапов в файл."""
+        try:
+            settings_file = ROOT_DIR / "backup_settings.json"
+            with open(settings_file, "w", encoding="utf-8") as f:
+                json.dump(self.backup_settings, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения настроек бэкапа: {e}")
+            return False
+    
+    def load_backup_settings(self) -> bool:
+        """Загружает настройки автобэкапов из файла."""
+        try:
+            settings_file = ROOT_DIR / "backup_settings.json"
+            if settings_file.exists():
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    self.backup_settings = json.load(f)
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка загрузки настроек бэкапа: {e}")
+            return False
+    
+    def cleanup_old_backups(self):
+        """Удаляет старые бэкапы, оставляя только указанное количество."""
+        try:
+            backup_files = list(self.backup_dir.glob("world_backup_*.tar.gz"))
+            backup_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            
+            keep_count = self.backup_settings.get("keep_count", 7)
+            if len(backup_files) > keep_count:
+                for old_backup in backup_files[keep_count:]:
+                    old_backup.unlink()
+                    logger.info(f"Удален старый бэкап: {old_backup.name}")
+        except Exception as e:
+            logger.error(f"Ошибка очистки старых бэкапов: {e}")
+    
+    async def auto_backup_task(self):
+        """Задача автоматического бэкапа."""
+        try:
+            logger.info("Выполняется автоматический бэкап...")
+            success, result, backup_path = self.create_backup()
+            
+            if success and backup_path:
+                # Очищаем старые бэкапы
+                self.cleanup_old_backups()
+                
+                # Отправляем в чат для бэкапов
+                try:
+                    with open(backup_path, "rb") as file:
+                        await self.bot.send_document(
+                            chat_id=self.config.BACKUP_CHAT_ID,
+                            document=types.BufferedInputFile(file.read(), filename=backup_path.name),
+                            caption=f"🤖 Автоматический бэкап мира Minecraft\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        )
+                    logger.info(f"Автобэкап успешно создан и отправлен: {backup_path.name}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки автобэкапа: {e}")
+            else:
+                logger.error(f"Ошибка создания автобэкапа: {result}")
+        except Exception as e:
+            logger.error(f"Ошибка в задаче автобэкапа: {e}")
+    
+    def setup_auto_backup(self):
+        """Настраивает автоматические бэкапы."""
+        # Останавливаем предыдущую задачу если есть
+        if self.backup_job:
+            self.backup_job.stop()
+            self.backup_job = None
+        
+        if not self.backup_settings.get("enabled", False):
+            logger.info("Автобэкапы отключены")
+            return
+        
+        interval = self.backup_settings.get("interval", "daily")
+        backup_time = self.backup_settings.get("time", "03:00")
+        
+        try:
+            if interval == "15min":
+                # Каждые 15 минут
+                self.backup_job = aiocron.crontab('*/15 * * * *', func=self.auto_backup_task)
+            elif interval == "30min":
+                # Каждые 30 минут
+                self.backup_job = aiocron.crontab('*/30 * * * *', func=self.auto_backup_task)
+            elif interval == "hourly":
+                # Каждый час
+                self.backup_job = aiocron.crontab('0 * * * *', func=self.auto_backup_task)
+            elif interval == "daily":
+                # Каждый день в указанное время
+                hour, minute = backup_time.split(":")
+                self.backup_job = aiocron.crontab(f'{minute} {hour} * * *', func=self.auto_backup_task)
+            elif interval == "weekly":
+                # Каждую неделю в воскресенье в указанное время
+                hour, minute = backup_time.split(":")
+                self.backup_job = aiocron.crontab(f'{minute} {hour} * * 0', func=self.auto_backup_task)
+            
+            if self.backup_job:
+                logger.info(f"Автобэкапы настроены: {interval} в {backup_time if interval in ['daily', 'weekly'] else 'по расписанию'}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка настройки автобэкапов: {e}")
+    
+    def get_backup_settings_keyboard(self) -> InlineKeyboardMarkup:
+        """Создает клавиатуру для настроек бэкапов."""
+        builder = InlineKeyboardBuilder()
+        
+        # Статус автобэкапов
+        status = "✅ Включены" if self.backup_settings.get("enabled", False) else "❌ Отключены"
+        builder.row(
+            InlineKeyboardButton(text=f"Автобэкапы: {status}", callback_data="toggle_auto_backup")
+        )
+        
+        if self.backup_settings.get("enabled", False):
+            # Интервал
+            interval_text = {
+                "15min": "15 минут",
+                "30min": "30 минут", 
+                "hourly": "Каждый час",
+                "daily": "Ежедневно",
+                "weekly": "Еженедельно"
+            }.get(self.backup_settings.get("interval", "daily"), "Ежедневно")
+            
+            builder.row(
+                InlineKeyboardButton(text=f"Интервал: {interval_text}", callback_data="set_backup_interval")
+            )
+            
+            # Время (только для daily/weekly)
+            if self.backup_settings.get("interval") in ["daily", "weekly"]:
+                builder.row(
+                    InlineKeyboardButton(text=f"Время: {self.backup_settings.get('time', '03:00')}", callback_data="set_backup_time")
+                )
+            
+            # Количество хранимых бэкапов
+            builder.row(
+                InlineKeyboardButton(text=f"Хранить: {self.backup_settings.get('keep_count', 7)} бэкапов", callback_data="set_backup_count")
+            )
+        
+        builder.row(
+            InlineKeyboardButton(text="💾 Создать бэкап сейчас", callback_data="create_backup")
+        )
+        builder.row(
+            InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")
+        )
+        
+        return builder.as_markup()
+    
+    def get_interval_keyboard(self) -> InlineKeyboardMarkup:
+        """Создает клавиатуру для выбора интервала бэкапов."""
+        builder = InlineKeyboardBuilder()
+        
+        intervals = [
+            ("15min", "⚡ Каждые 15 минут"),
+            ("30min", "🔄 Каждые 30 минут"),
+            ("hourly", "⏰ Каждый час"),
+            ("daily", "📅 Ежедневно"),
+            ("weekly", "📆 Еженедельно")
+        ]
+        
+        for interval_key, interval_name in intervals:
+            current = "✅ " if self.backup_settings.get("interval") == interval_key else ""
+            builder.row(
+                InlineKeyboardButton(text=f"{current}{interval_name}", callback_data=f"interval_{interval_key}")
+            )
+        
+        builder.row(
+            InlineKeyboardButton(text="↩️ Назад", callback_data="backup_settings")
+        )
+        
+        return builder.as_markup()
+    
+    def _get_backup_settings_text(self) -> str:
+        """Возвращает текст с текущими настройками бэкапов."""
+        status = "✅ Включены" if self.backup_settings.get("enabled", False) else "❌ Отключены"
+        
+        interval_text = {
+            "15min": "Каждые 15 минут",
+            "30min": "Каждые 30 минут", 
+            "hourly": "Каждый час",
+            "daily": "Ежедневно",
+            "weekly": "Еженедельно"
+        }.get(self.backup_settings.get("interval", "daily"), "Ежедневно")
+        
+        text = f"⚙️ <b>Настройки автоматических бэкапов</b>\n\n"
+        text += f"Статус: {status}\n"
+        
+        if self.backup_settings.get("enabled", False):
+            text += f"Интервал: {interval_text}\n"
+            
+            if self.backup_settings.get("interval") in ["daily", "weekly"]:
+                text += f"Время: {self.backup_settings.get('time', '03:00')}\n"
+            
+            text += f"Хранить бэкапов: {self.backup_settings.get('keep_count', 7)}\n"
+            
+            # Показываем следующий запланированный бэкап
+            if self.backup_job:
+                text += f"\n📅 Следующий бэкап запланирован согласно расписанию"
+        
+        return text
+    
     def get_server_info(self) -> str:
         """Получает информацию о сервере."""
         info_lines = [self.get_server_status()]
@@ -237,7 +453,7 @@ class MinecraftServerBot:
             info_lines.append(f"<b>Память:</b> {memory_info}")
             
             # Дисковое пространство
-            disk = subprocess.run(["df", "-h", self.server_dir], capture_output=True, text=True).stdout.strip().split("\n")[1]
+            disk = subprocess.run(["df", "-h", "/server"], capture_output=True, text=True).stdout.strip().split("\n")[1]
             disk_info = " ".join(disk.split()[1:5])
             info_lines.append(f"<b>Диск:</b> {disk_info}")
             
@@ -248,8 +464,8 @@ class MinecraftServerBot:
             # IP сервера
             info_lines.append(f"<b>IP сервера:</b> {self.config.SERVER_IP}:{self.config.SERVER_PORT}")
             
-            # Директория сервера
-            info_lines.append(f"<b>Директория:</b> {self.server_dir}")
+            # Директория сервера (показываем реальный путь на хосте)
+            info_lines.append(f"<b>Директория:</b> /root/projects/mrok-minecraft-server")
             
         except Exception as e:
             info_lines.append(f"<b>Ошибка получения информации:</b> {e}")
@@ -318,6 +534,7 @@ class MinecraftServerBot:
             InlineKeyboardButton(text="💾 Создать бэкап", callback_data="create_backup"),
         )
         builder.row(
+            InlineKeyboardButton(text="⚙️ Настройки бэкапов", callback_data="backup_settings"),
             InlineKeyboardButton(text="📢 Отправить сообщение", callback_data="send_message")
         )
         
@@ -875,6 +1092,110 @@ class MinecraftServerBot:
             )
             await callback.answer()
         
+        # Обработчики настроек бэкапов
+        @self.router.callback_query(F.data == "backup_settings")
+        async def callback_backup_settings(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            settings_text = self._get_backup_settings_text()
+            await callback.message.edit_text(
+                settings_text,
+                reply_markup=self.get_backup_settings_keyboard(),
+            )
+            await callback.answer()
+        
+        @self.router.callback_query(F.data == "toggle_auto_backup")
+        async def callback_toggle_auto_backup(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            self.backup_settings["enabled"] = not self.backup_settings.get("enabled", False)
+            self.save_backup_settings()
+            self.setup_auto_backup()
+            
+            status = "включены" if self.backup_settings["enabled"] else "отключены"
+            await callback.answer(f"✅ Автобэкапы {status}")
+            
+            settings_text = self._get_backup_settings_text()
+            await callback.message.edit_text(
+                settings_text,
+                reply_markup=self.get_backup_settings_keyboard(),
+            )
+        
+        @self.router.callback_query(F.data == "set_backup_interval")
+        async def callback_set_backup_interval(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            await callback.message.edit_text(
+                "⏰ <b>Выберите интервал для автобэкапов:</b>",
+                reply_markup=self.get_interval_keyboard(),
+            )
+            await callback.answer()
+        
+        @self.router.callback_query(F.data.startswith("interval_"))
+        async def callback_set_interval(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            interval = callback.data.replace("interval_", "")
+            self.backup_settings["interval"] = interval
+            self.save_backup_settings()
+            self.setup_auto_backup()
+            
+            interval_names = {
+                "15min": "каждые 15 минут",
+                "30min": "каждые 30 минут",
+                "hourly": "каждый час",
+                "daily": "ежедневно",
+                "weekly": "еженедельно"
+            }
+            
+            await callback.answer(f"✅ Интервал установлен: {interval_names.get(interval, interval)}")
+            
+            settings_text = self._get_backup_settings_text()
+            await callback.message.edit_text(
+                settings_text,
+                reply_markup=self.get_backup_settings_keyboard(),
+            )
+        
+        @self.router.callback_query(F.data == "set_backup_time")
+        async def callback_set_backup_time(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            await callback.message.edit_text(
+                "🕐 <b>Введите время для бэкапов в формате ЧЧ:ММ</b>\n\n"
+                "Например: 03:00 или 15:30\n"
+                "Время указывается в 24-часовом формате.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="↩️ Назад", callback_data="backup_settings")]
+                ]),
+            )
+            await callback.answer()
+        
+        @self.router.callback_query(F.data == "set_backup_count")
+        async def callback_set_backup_count(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            await callback.message.edit_text(
+                "📦 <b>Введите количество бэкапов для хранения</b>\n\n"
+                "Рекомендуется: 5-10 бэкапов\n"
+                "Старые бэкапы будут автоматически удаляться.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="↩️ Назад", callback_data="backup_settings")]
+                ]),
+            )
+            await callback.answer()
+        
         # Обработчик текстовых сообщений
         @self.router.message(F.text)
         async def handle_text(message: Message):
@@ -937,6 +1258,70 @@ class MinecraftServerBot:
                     )
                 return
             
+            # Проверяем, находимся ли мы в режиме ввода времени бэкапа
+            elif message.reply_to_message and "время для бэкапов" in message.reply_to_message.text:
+                time_text = message.text.strip()
+                
+                # Проверяем формат времени
+                try:
+                    time_parts = time_text.split(":")
+                    if len(time_parts) != 2:
+                        raise ValueError("Неверный формат")
+                    
+                    hour = int(time_parts[0])
+                    minute = int(time_parts[1])
+                    
+                    if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+                        raise ValueError("Неверное время")
+                    
+                    # Форматируем время
+                    formatted_time = f"{hour:02d}:{minute:02d}"
+                    
+                    self.backup_settings["time"] = formatted_time
+                    self.save_backup_settings()
+                    self.setup_auto_backup()
+                    
+                    await message.answer(
+                        f"✅ Время бэкапов установлено: {formatted_time}",
+                        reply_markup=self.get_backup_settings_keyboard(),
+                    )
+                    
+                except ValueError:
+                    await message.answer(
+                        "❌ Неверный формат времени!\n\n"
+                        "Используйте формат ЧЧ:ММ (например: 03:00 или 15:30)",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="↩️ Назад", callback_data="backup_settings")]
+                        ]),
+                    )
+                return
+            
+            # Проверяем, находимся ли мы в режиме ввода количества бэкапов
+            elif message.reply_to_message and "количество бэкапов" in message.reply_to_message.text:
+                try:
+                    count = int(message.text.strip())
+                    
+                    if count < 1 or count > 50:
+                        raise ValueError("Количество должно быть от 1 до 50")
+                    
+                    self.backup_settings["keep_count"] = count
+                    self.save_backup_settings()
+                    
+                    await message.answer(
+                        f"✅ Количество хранимых бэкапов установлено: {count}",
+                        reply_markup=self.get_backup_settings_keyboard(),
+                    )
+                    
+                except ValueError as e:
+                    await message.answer(
+                        f"❌ Неверное значение!\n\n"
+                        f"Введите число от 1 до 50",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="↩️ Назад", callback_data="backup_settings")]
+                        ]),
+                    )
+                return
+            
             # Если это не ответ на запрос, показываем меню
             await message.answer(
                 "🤖 <b>Главное меню</b>\nВыберите действие:",
@@ -947,6 +1332,8 @@ class MinecraftServerBot:
         """Запуск бота."""
         logger.info("Запуск Minecraft Server Bot...")
         self.load_whitelist()
+        self.load_backup_settings()
+        self.setup_auto_backup()
         
         try:
             await self.bot.delete_webhook()
@@ -954,6 +1341,8 @@ class MinecraftServerBot:
         except asyncio.CancelledError:
             logger.info("Бот остановлен")
         finally:
+            if self.backup_job:
+                self.backup_job.stop()
             await self.bot.session.close()
 
 
