@@ -531,31 +531,75 @@ class MinecraftServerBot:
         return "\n".join(info_lines)
     
     def get_logs(self, lines: int = 50) -> str:
-        """Получает последние строки логов из systemd journal."""
+        """Получает последние строки логов из разных источников."""
         try:
-            # Сначала пробуем получить логи из systemd journal
-            result = subprocess.run(
-                ["journalctl", "-u", self.config.SERVER_SERVICE, "-n", str(lines), "--no-pager"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+            # Метод 1: Пробуем получить логи из systemd journal
+            try:
+                result = subprocess.run(
+                    ["journalctl", "-u", self.config.SERVER_SERVICE, "-n", str(lines), "--no-pager"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0 and result.stdout.strip() and "-- No entries --" not in result.stdout:
+                    return result.stdout.strip()
+            except Exception as e:
+                logger.error(f"Ошибка получения логов через journalctl: {e}")
             
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
+            # Метод 2: Пробуем файл логов сервера
+            try:
+                if self.server_log.exists():
+                    with open(self.server_log, "r", encoding="utf-8", errors="ignore") as f:
+                        all_lines = f.readlines()
+                        last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                        if last_lines:
+                            return "".join(last_lines)
+            except Exception as e:
+                logger.error(f"Ошибка чтения файла логов: {e}")
             
-            # Если не получилось через journalctl, пробуем файл логов
-            if self.server_log.exists():
-                with open(self.server_log, "r", encoding="utf-8", errors="ignore") as f:
-                    all_lines = f.readlines()
-                    last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-                    return "".join(last_lines)
-            else:
-                return "Логи не найдены"
+            # Метод 3: Пробуем другие возможные файлы логов
+            possible_log_files = [
+                self.server_dir / "logs" / "debug.log",
+                self.server_dir / "server.log",
+                self.server_dir / "minecraft_server.log",
+            ]
+            
+            for log_file in possible_log_files:
+                try:
+                    if log_file.exists():
+                        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                            all_lines = f.readlines()
+                            last_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+                            if last_lines:
+                                return f"Логи из {log_file.name}:\n" + "".join(last_lines)
+                except Exception as e:
+                    logger.error(f"Ошибка чтения {log_file}: {e}")
+            
+            # Метод 4: Пробуем получить логи через systemctl status
+            try:
+                result = subprocess.run(
+                    ["systemctl", "status", self.config.SERVER_SERVICE, "-n", str(min(lines, 20))],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode in [0, 3] and result.stdout.strip():  # 3 = inactive but ok
+                    return f"Статус сервиса:\n{result.stdout.strip()}"
+            except Exception as e:
+                logger.error(f"Ошибка получения статуса сервиса: {e}")
+            
+            return "Логи не найдены. Возможные причины:\n" \
+                   "• Сервер не запущен\n" \
+                   "• Логи еще не созданы\n" \
+                   "• Проблемы с доступом к файлам логов\n\n" \
+                   "Попробуйте запустить сервер или проверить его статус."
+                   
         except subprocess.TimeoutExpired:
             return "Таймаут получения логов"
         except Exception as e:
-            return f"Ошибка чтения логов: {e}"
+            return f"Ошибка получения логов: {e}"
     
     def create_backup(self) -> Tuple[bool, str, Optional[Path]]:
         """Создает резервную копию мира."""
@@ -585,14 +629,17 @@ class MinecraftServerBot:
         )
         builder.row(
             InlineKeyboardButton(text="📜 Логи сервера", callback_data="server_logs"),
+            InlineKeyboardButton(text="🔍 Статус сервиса", callback_data="service_status"),
+        )
+        builder.row(
             InlineKeyboardButton(text="⚙️ Управление", callback_data="server_control"),
+            InlineKeyboardButton(text="�  Белый список", callback_data="whitelist_menu"),
         )
         builder.row(
-            InlineKeyboardButton(text="👥 Белый список", callback_data="whitelist_menu"),
             InlineKeyboardButton(text="💾 Создать бэкап", callback_data="create_backup"),
+            InlineKeyboardButton(text="⚙️ Настройки бэкапов", callback_data="backup_settings"),
         )
         builder.row(
-            InlineKeyboardButton(text="⚙️ Настройки бэкапов", callback_data="backup_settings"),
             InlineKeyboardButton(text="📢 Отправить сообщение", callback_data="send_message")
         )
         
@@ -851,6 +898,50 @@ class MinecraftServerBot:
                 f"📜 <b>Последние 50 строк логов:</b>\n\n<code>{logs_text}</code>",
                 reply_markup=self.get_main_keyboard(),
             )
+            await callback.answer()
+        
+        @self.router.callback_query(F.data == "service_status")
+        async def callback_service_status(callback: CallbackQuery):
+            if not self.is_admin(callback.from_user.id):
+                await callback.answer("⛔ Нет доступа", show_alert=True)
+                return
+            
+            try:
+                # Получаем детальный статус сервиса
+                result = subprocess.run(
+                    ["systemctl", "status", self.config.SERVER_SERVICE, "--no-pager", "-l"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                status_text = f"🔍 <b>Статус сервиса {self.config.SERVER_SERVICE}</b>\n\n"
+                
+                if result.stdout:
+                    # Ограничиваем вывод для Telegram
+                    output = result.stdout
+                    if len(output) > 3500:
+                        output = output[:3500] + "\n... (обрезано)"
+                    status_text += f"<code>{output}</code>"
+                else:
+                    status_text += "Информация о сервисе недоступна"
+                
+                await callback.message.edit_text(
+                    status_text,
+                    reply_markup=self.get_main_keyboard(),
+                )
+                
+            except subprocess.TimeoutExpired:
+                await callback.message.edit_text(
+                    "⏱️ Таймаут получения статуса сервиса",
+                    reply_markup=self.get_main_keyboard(),
+                )
+            except Exception as e:
+                await callback.message.edit_text(
+                    f"❌ Ошибка получения статуса: {e}",
+                    reply_markup=self.get_main_keyboard(),
+                )
+            
             await callback.answer()
         
         @self.router.callback_query(F.data == "server_control")
